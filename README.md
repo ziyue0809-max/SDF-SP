@@ -1,26 +1,19 @@
 # SDF-SP
 
-`SDF_SP.ipynb` contains the semantic dual-order base forecaster, training-only
-retrieval memory, global and node-level simplicial projections, and statistical
-adaptive fusion. The notebook contains code only, with no comments, saved cell
-outputs, or print statements. Artifacts are saved to a separate output directory
-for each run.
+SDF-SP combines a semantically conditioned dual-order spatiotemporal encoder with
+retrieval-based forecast correction. A frozen GPT-2 backbone produces the base
+forecast, which is refined through global and node-level simplicial projections
+and adaptive fusion.
 
 ## Setup
-
-Install Python 3.10 or later and the dependencies in `requirements.txt`:
 
 ```sh
 pip install -r requirements.txt
 jupyter lab SDF_SP.ipynb
 ```
 
-Place a locally loadable Hugging Face GPT-2 model (configuration and weights) in
-`pretrained/gpt2/`, or change `GPT2_PATH` in the first cell. Loading is local-only.
-The intended backbone is GPT-2 with its native causal attention and frozen parameters.
-No datasets or pretrained weights are included.
-
-Run the notebook from this directory, from the first cell to the last:
+Place the GPT-2 configuration and weights in `pretrained/gpt2/`. Set the data and
+model paths in the first cell, then run the notebook in order.
 
 ```text
 data/
@@ -33,26 +26,27 @@ data/
 pretrained/
   gpt2/
     config.json
-    model.safetensors (or pytorch_model.bin)
+    model.safetensors
 SDF_SP.ipynb
 ```
 
-## Prepared input datasets
+GPT-2 weights in `pytorch_model.bin` format can also be used.
 
-Each `.npz` file must contain the following arrays. `S` can differ between files;
-node order, node count, embedding dimensions, and forecast horizon must agree.
+## Data
 
-| Key | Shape | Contents |
+The notebook reads prepared training, validation, and test files with the same
+array structure:
+
+| Key | Shape | Description |
 | --- | --- | --- |
-| `x` | `[S, N, T]` | Finite historical observations in original measurement units |
-| `y` | `[S, N, H]` | Finite future targets in the same units |
-| `event` | `[S, 4096]` | Context embedding aligned to each sample's forecast origin |
-| `future_time` | `[S, H]` | Known forecast timestamps, stored as Unicode ISO strings or `datetime64` |
+| `x` | `[S, N, T]` | Historical observations |
+| `y` | `[S, N, H]` | Forecast targets |
+| `event` | `[S, 4096]` | Context embedding for each sample |
+| `future_time` | `[S, H]` | Forecast timestamps as Unicode strings or `datetime64` |
 
-The default configuration is `N=79`, `T=24`, `H=8`. Change the first cell if needed.
-The loader reads these arrays directly; it does not perform custom input validation.
-The projection memory requires at least six training samples. Object arrays and
-pickled dictionaries are not supported. Save already prepared arrays as follows:
+Here, `S` is the number of samples, `N` the number of nodes, `T` the input length,
+and `H` the forecast horizon. The defaults are `N=79`, `T=24`, and `H=8`.
+Observations and targets use their original measurement units.
 
 ```python
 np.savez_compressed(
@@ -64,58 +58,45 @@ np.savez_compressed(
 )
 ```
 
-Use the same keys for `val.npz` and `test.npz`. Supply per-sample embeddings directly;
-the notebook does not repeat daily embeddings or look them up by original-series indices.
+Save validation and test data in the same format. Keep the node order consistent
+across the data, graph, and semantic embeddings.
 
-The notebook performs no partitioning, day slicing, or sliding-window generation.
-Prepare train, validation, and test datasets upstream using the intended temporal
-protocol. Targets must remain within their assigned partition; any preceding
-historical context must predate the forecast origin. Supplying three separate files
-does not itself prove that the datasets are chronological or disjoint. No original
-series identifiers are assumed and no identifier-based overlap mask is applied.
-Validation selects the base checkpoint; test labels are used only for evaluation.
-
-## Graph and semantic inputs
-
-| File | Shape | Contents |
+| File | Shape | Description |
 | --- | --- | --- |
-| `adjacency.npy` | `[N,N]` | Finite nonnegative base graph weights; self-loops and symmetric degree normalization are applied in the model |
-| `node_embeddings.npy` | `[N,4096]` | Finite node semantic vectors, aligned to the node axis in every dataset |
-| `semantic_adjacency.npy` | `[N,N]` | Cosine similarities of the original node semantic vectors; diagonal is set to zero by the model |
+| `adjacency.npy` | `[N, N]` | Nonnegative graph adjacency weights |
+| `node_embeddings.npy` | `[N, 4096]` | Node semantic embeddings |
+| `semantic_adjacency.npy` | `[N, N]` | Pairwise cosine similarities of the node embeddings |
 
-Context embeddings must contain only information available at forecast time.
-Construct any data-derived graph or preprocessing statistics without future labels.
+The model adds self-loops and normalizes the graph. The diagonal of the semantic
+similarity matrix is set to zero.
 
-## Retained method and settings
+Calendar features in `make_time_features` use 15-minute intervals, 36 daily slots,
+and a 09:00 start. Adjust this function for a different sampling schedule.
 
-- Shared temporal/spatial operators with TS and ST branches, semantic feature/edge
-  modulation, and context-conditioned branch fusion.
-- Temporal/spatial tokenization and a frozen GPT-2 backbone.
-- Huber loss, Adam at `1e-3`, batch size 24, at most 2500 epochs, and early stopping
-  after 50 epochs without validation-loss improvement.
-- Training-only residual memory `y - x_last`, eight historical statistics per node
-  plus eight calendar features per forecast step, and training-memory standardization.
-- Six retrieved candidates, mutual 3-nearest-neighbor edges, radius factor 2, and
-  local vertex/edge/triangle projection at global and node levels.
-- For each sample and node, `dg = mean(abs(global - base))` and
-  `dn = mean(abs(node - base))` over the forecast horizon. Global weight is
-  `dn / (dg + dn)`; node weight is its complement. A denominator at most `1e-20`
-  uses equal weights. There are no label-fitted fusion coefficients.
+## Training and inference
 
-Calendar features retain the source implementation's 15-minute daytime convention:
-36 slots per day with a 09:00 origin. For datasets with another cadence, adapt
-`make_time_features` consistently before running experiments. MAE and RMSE use all
-targets. The retained WMAPE convention excludes zero-target errors from its numerator;
-its denominator requires a nonzero sum of targets. This is not a universal metric
-definition for signed or zero-sum datasets.
+The base model uses Huber loss and Adam with a learning rate of `1e-3` and batch
+size 24. Training runs for up to 2500 epochs, with early stopping after 50 epochs
+without improvement in validation loss.
 
-## Saved artifacts
+After training, the notebook builds a residual memory from the training data and
+retrieves six candidates per query. Global and node-level projections use local
+vertices, mutual 3-nearest-neighbor edges, and triangular faces, with a radius
+factor of 2.
 
-Each `outputs/<timestamp>/` directory contains the best base checkpoint, training
-memory, checkpoint/memory hashes, predictions, targets, per-sample/per-node fusion
-weights, and metrics. `Original_Base_New_RAG` is the adaptive-fusion result;
-`Original_SP` is the retained unscaled global-only comparison. Artifact key names
-are preserved for compatibility. The notebook does not print training logs or scores.
+Fusion weights depend on each projection's mean absolute change from the base
+forecast. For each sample and node, the global weight is `dn / (dg + dn)`, where
+`dg` and `dn` are the global and node-level correction magnitudes. The node weight
+is its complement. Both weights are 0.5 when the sum is at most `1e-20` and are
+shared across forecast steps.
 
-Only code and documentation are included in this release folder. A full training
-run with the intended data and pretrained checkpoint is required to reproduce results.
+## Results
+
+Each run saves its checkpoint, retrieval memory, predictions, fusion weights, and
+metrics under `outputs/<timestamp>/`.
+
+In `metrics.json`, `Original_Base` is the base forecast and `Original_Base_New_RAG`
+is the final adaptive-fusion forecast. `Original_SP`, `Weighted_global_hard`, and
+`Node_hard` report the unscaled global, scaled global, and node-only projections.
+Metrics are reported for the first four steps and all eight steps. WMAPE is
+computed as `100 * sum(abs(pred - y)[y != 0]) / sum(y)`.
